@@ -1,0 +1,101 @@
+name: Orders CI/CD
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orders-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Tests e imagen
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: pedidos_ci
+          MYSQL_USER: pedidos_ci
+          MYSQL_PASSWORD: ci-only-password
+          MYSQL_ROOT_PASSWORD: ci-only-root-password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="MYSQL_PWD=ci-only-password mysql --protocol=TCP -h 127.0.0.1 -u pedidos_ci --database=pedidos_ci -e 'SELECT 1'"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+          --health-start-period=30s
+    env:
+      DB_URL: jdbc:mysql://127.0.0.1:3306/pedidos_ci?allowPublicKeyRetrieval=true&useSSL=false
+      DB_USERNAME: pedidos_ci
+      DB_PASSWORD: ci-only-password
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Ejecutar todos los tests
+        run: bash mvnw -B -ntp verify
+      - name: Verificar control de despliegue y rollback
+        run: python3 -B -m unittest discover -s scripts/tests -v
+      - name: Guardar resultados de tests
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-results
+          path: target/surefire-reports/
+          retention-days: 7
+      - name: Construir imagen del commit
+        run: docker build --tag "orders-service:${GITHUB_SHA}" .
+      - name: Preparar imagen para despliegue
+        if: github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch
+        run: docker save "orders-service:${GITHUB_SHA}" | gzip > orders-image.tar.gz
+      - name: Guardar imagen
+        if: github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: orders-image-${{ github.sha }}
+          path: orders-image.tar.gz
+          compression-level: 0
+          retention-days: 3
+
+  deploy:
+    name: Desplegar en PC de la demo
+    needs: verify
+    if: github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch && github.event.repository.private
+    runs-on: [self-hosted, Linux, X64, orders-demo]
+    timeout-minutes: 10
+    concurrency:
+      group: orders-demo-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: orders-image-${{ github.sha }}
+          path: ${{ runner.temp }}/orders-image
+      - name: Cargar y desplegar imagen validada
+        env:
+          ORDERS_ENV_FILE: /home/jesibel/PedidoMService/.env
+        run: |
+          docker load --input "$RUNNER_TEMP/orders-image/orders-image.tar.gz"
+          bash scripts/deploy-local.sh "orders-service:${GITHUB_SHA}"
+      - name: Limpiar archivo de imagen descargado
+        if: always()
+        run: rm -f "$RUNNER_TEMP/orders-image/orders-image.tar.gz"

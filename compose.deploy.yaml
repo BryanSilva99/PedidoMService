@@ -1,0 +1,4 @@
+services:
+  orders-service:
+    image: ${ORDERS_DEPLOY_IMAGE:?Indica la imagen validada por CI}
+    pull_policy: never
